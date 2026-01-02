@@ -21,7 +21,7 @@ app.use(cors());
 app.use(express.json());
 
 // Conectar a MongoDB
-const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/impostor-game';
 mongoose.connect(MONGODB_URI)
     .then(() => console.log('✅ MongoDB conectado'))
     .catch(err => console.error('❌ Error MongoDB:', err));
@@ -106,8 +106,18 @@ io.on('connection', (socket) => {
 
             room.settings.impostorCount = data.settings.impostorCount;
             room.settings.roundDuration = data.settings.roundDuration;
+            room.settings.category = data.settings.category || 'all';
+            room.settings.impostorCanSeeHint = data.settings.impostorCanSeeHint !== undefined
+                ? data.settings.impostorCanSeeHint
+                : false;
 
             await room.save();
+
+            console.log('⚙️ Configuración actualizada:', {
+                roomCode: room.roomCode,
+                settings: room.settings
+            });
+
             io.to(data.roomCode).emit('room-update', room);
         } catch (error) {
             console.error('Error actualizando configuración:', error);
@@ -128,9 +138,16 @@ io.on('connection', (socket) => {
             // Seleccionar impostores
             const impostorIds = selectImpostors(room.players, room.settings.impostorCount);
 
-            // Obtener palabra y pista
-            const { word, hint } = getRandomWord();
+            // Obtener palabra y pista según la categoría configurada
+            const { word, hint } = getRandomWord(room.settings.category);
 
+            console.log('🎮 Juego iniciado:', {
+                roomCode: room.roomCode,
+                word,
+                hint,
+                category: room.settings.category,
+                impostorCanSeeHint: room.settings.impostorCanSeeHint
+            });
 
             room.players.forEach(player => {
                 player.isImpostor = impostorIds.includes(player.id);
@@ -149,7 +166,10 @@ io.on('connection', (socket) => {
                 io.to(player.id).emit('role-assigned', {
                     isImpostor: player.isImpostor,
                     word: player.isImpostor ? null : word,
-                    hint: player.isImpostor ? hint : null
+                    // Si el impostor puede ver la pista, se la enviamos
+                    hint: player.isImpostor
+                        ? (room.settings.impostorCanSeeHint ? hint : null)
+                        : null
                 });
             });
 
@@ -283,18 +303,64 @@ io.on('connection', (socket) => {
                     }
                 });
 
-                // Encontrar al más votado
+                // Encontrar el máximo número de votos
                 let maxVotes = 0;
-                let votedOutPlayerId = null;
-                Object.entries(voteCounts).forEach(([playerId, votes]) => {
-                    if (votes > maxVotes) {
-                        maxVotes = votes;
-                        votedOutPlayerId = playerId;
-                    }
+                Object.values(voteCounts).forEach(votes => {
+                    if (votes > maxVotes) maxVotes = votes;
                 });
 
+                // Encontrar todos los jugadores con el máximo de votos (posible empate)
+                const tiedPlayers = Object.entries(voteCounts)
+                    .filter(([playerId, votes]) => votes === maxVotes)
+                    .map(([playerId]) => playerId);
+
+                console.log('📊 Resultado de votación:', {
+                    voteCounts,
+                    maxVotes,
+                    tiedPlayers,
+                    hayEmpate: tiedPlayers.length > 1
+                });
+
+                // CASO 1: HAY EMPATE
+                if (tiedPlayers.length > 1) {
+                    console.log('⚖️ EMPATE DETECTADO - Nueva ronda de votación');
+
+                    // Resetear votos para nueva ronda
+                    verifyRoom.players.forEach(player => {
+                        player.hasVoted = false;
+                        player.votedFor = null;
+                    });
+
+                    verifyRoom.gameState = 'voting'; // Mantener en votación
+                    await verifyRoom.save();
+
+                    // Notificar empate y nueva votación
+                    io.to(data.roomCode).emit('voting-tie', {
+                        tiedPlayers: tiedPlayers.map(id => {
+                            const player = verifyRoom.players.find(p => p.id === id);
+                            return {
+                                id: player.id,
+                                name: player.name
+                            };
+                        }),
+                        voteCounts
+                    });
+
+                    // Enviar room-update para resetear UI
+                    io.to(data.roomCode).emit('room-update', verifyRoom);
+
+                    return; // Salir y esperar nueva votación
+                }
+
+                // CASO 2: HAY GANADOR CLARO
+                const votedOutPlayerId = tiedPlayers[0];
                 const votedOutPlayer = verifyRoom.players.find(p => p.id === votedOutPlayerId);
                 const impostorFound = votedOutPlayer?.isImpostor || false;
+
+                console.log('🎯 Jugador eliminado:', {
+                    name: votedOutPlayer?.name,
+                    isImpostor: impostorFound
+                });
 
                 verifyRoom.gameState = 'ended';
                 await verifyRoom.save();
