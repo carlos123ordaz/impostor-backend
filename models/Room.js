@@ -21,9 +21,8 @@ const RoomSchema = new mongoose.Schema({
     adminId: { type: String, required: true },
     settings: {
         impostorCount: { type: Number, default: 1 },
-        roundDuration: { type: Number, default: 120 }, // segundos
-        category: { type: String, default: 'all' }, // all, animales, lugares, objetos, comida, etc.
-        impostorCanSeeHint: { type: Boolean, default: false } // si el impostor puede ver la pista
+        category: { type: String, default: 'all' },
+        impostorCanSeeHint: { type: Boolean, default: false }
     },
     gameState: {
         type: String,
@@ -32,10 +31,11 @@ const RoomSchema = new mongoose.Schema({
     },
     currentWord: { type: String, default: null },
     currentHint: { type: String, default: null },
-    timeRemaining: { type: Number, default: null },
     isPaused: { type: Boolean, default: false },
+    turnOrder: [{ type: String }], // IDs de jugadores en orden de turnos
+    currentTurnIndex: { type: Number, default: 0 },
     votes: { type: Map, of: Number, default: {} },
-    createdAt: { type: Date, default: Date.now, expires: 86400 } // 24 horas
+    createdAt: { type: Date, default: Date.now, expires: 86400 }
 }, { timestamps: true });
 
 module.exports = mongoose.model('Room', RoomSchema);

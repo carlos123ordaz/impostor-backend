@@ -14,7 +14,9 @@ const io = socketIo(server, {
     cors: {
         origin: process.env.CLIENT_URL || "http://localhost:5173",
         methods: ["GET", "POST"]
-    }
+    },
+    pingTimeout: 60000,
+    pingInterval: 25000
 });
 
 app.use(cors());
@@ -26,8 +28,8 @@ mongoose.connect(MONGODB_URI)
     .then(() => console.log('✅ MongoDB conectado'))
     .catch(err => console.error('❌ Error MongoDB:', err));
 
-// Timers activos para cada sala
-const roomTimers = {};
+// Mapa para reconexiones: playerId -> {roomCode, playerName}
+const playerSessions = new Map();
 
 // Socket.IO eventos
 io.on('connection', (socket) => {
@@ -47,12 +49,19 @@ io.on('connection', (socket) => {
                 }],
                 settings: {
                     impostorCount: 1,
-                    roundDuration: 120
+                    category: 'all',
+                    impostorCanSeeHint: false
                 }
             });
 
             await room.save();
             socket.join(roomCode);
+
+            // Guardar sesión
+            playerSessions.set(socket.id, {
+                roomCode,
+                playerName: data.playerName
+            });
 
             callback({ success: true, roomCode });
             io.to(roomCode).emit('room-update', room);
@@ -89,10 +98,92 @@ io.on('connection', (socket) => {
             await room.save();
             socket.join(data.roomCode.toUpperCase());
 
+            // Guardar sesión
+            playerSessions.set(socket.id, {
+                roomCode: data.roomCode.toUpperCase(),
+                playerName: data.playerName
+            });
+
             callback({ success: true, isAdmin: false });
             io.to(data.roomCode.toUpperCase()).emit('room-update', room);
         } catch (error) {
             console.error('Error uniéndose a sala:', error);
+            callback({ success: false, error: error.message });
+        }
+    });
+
+    // Reconectar a sala existente
+    socket.on('reconnect-to-room', async (data, callback) => {
+        try {
+            const room = await Room.findOne({ roomCode: data.roomCode.toUpperCase() });
+
+            if (!room) {
+                return callback({ success: false, error: 'Sala no encontrada' });
+            }
+
+            // Buscar al jugador por nombre
+            const playerIndex = room.players.findIndex(p => p.name === data.playerName);
+
+            if (playerIndex === -1) {
+                return callback({ success: false, error: 'Jugador no encontrado en esta sala' });
+            }
+
+            // Actualizar el ID del socket del jugador
+            const oldId = room.players[playerIndex].id;
+            room.players[playerIndex].id = socket.id;
+
+            // Si era admin, actualizar adminId
+            if (room.adminId === oldId) {
+                room.adminId = socket.id;
+            }
+
+            // IMPORTANTE: Actualizar el turnOrder con el nuevo socket ID
+            if (room.turnOrder && room.turnOrder.length > 0) {
+                const turnIndex = room.turnOrder.indexOf(oldId);
+                if (turnIndex !== -1) {
+                    room.turnOrder[turnIndex] = socket.id;
+                    console.log(`🔄 TurnOrder actualizado en posición ${turnIndex}: ${oldId} -> ${socket.id}`);
+                    console.log(`📊 TurnOrder completo:`, room.turnOrder);
+                } else {
+                    console.log(`⚠️ OldId ${oldId} no encontrado en turnOrder:`, room.turnOrder);
+                }
+            } else {
+                console.log('⚠️ No hay turnOrder para actualizar');
+            }
+
+            await room.save();
+            socket.join(data.roomCode.toUpperCase());
+
+            // Actualizar sesión
+            playerSessions.set(socket.id, {
+                roomCode: data.roomCode.toUpperCase(),
+                playerName: data.playerName
+            });
+
+            const player = room.players[playerIndex];
+
+            callback({
+                success: true,
+                isAdmin: player.isAdmin,
+                gameState: room.gameState,
+                role: player.isImpostor !== undefined ? {
+                    isImpostor: player.isImpostor,
+                    word: player.isImpostor ? null : room.currentWord,
+                    hint: player.isImpostor
+                        ? (room.settings.impostorCanSeeHint ? room.currentHint : null)
+                        : null
+                } : null,
+                turnOrder: room.turnOrder || [],
+                currentTurnIndex: room.currentTurnIndex || 0
+            });
+
+            // Enviar room-update inmediatamente para sincronizar datos
+            io.to(data.roomCode.toUpperCase()).emit('room-update', room);
+
+            io.to(data.roomCode.toUpperCase()).emit('room-update', room);
+            console.log('✅ Jugador reconectado:', data.playerName);
+        } catch (error) {
+            console.error('Error reconectando:', error);
             callback({ success: false, error: error.message });
         }
     });
@@ -105,7 +196,6 @@ io.on('connection', (socket) => {
             if (!room || room.adminId !== socket.id) return;
 
             room.settings.impostorCount = data.settings.impostorCount;
-            room.settings.roundDuration = data.settings.roundDuration;
             room.settings.category = data.settings.category || 'all';
             room.settings.impostorCanSeeHint = data.settings.impostorCanSeeHint !== undefined
                 ? data.settings.impostorCanSeeHint
@@ -156,8 +246,12 @@ io.on('connection', (socket) => {
             room.gameState = 'started';
             room.currentWord = word;
             room.currentHint = hint;
-            room.timeRemaining = room.settings.roundDuration;
             room.isPaused = false;
+
+            // Crear orden de turnos aleatorio
+            const turnOrder = [...room.players].sort(() => Math.random() - 0.5);
+            room.turnOrder = turnOrder.map(p => p.id);
+            room.currentTurnIndex = 0;
 
             await room.save();
 
@@ -166,7 +260,6 @@ io.on('connection', (socket) => {
                 io.to(player.id).emit('role-assigned', {
                     isImpostor: player.isImpostor,
                     word: player.isImpostor ? null : word,
-                    // Si el impostor puede ver la pista, se la enviamos
                     hint: player.isImpostor
                         ? (room.settings.impostorCanSeeHint ? hint : null)
                         : null
@@ -175,35 +268,35 @@ io.on('connection', (socket) => {
 
             io.to(data.roomCode).emit('game-started', {
                 players: room.players,
-                timeRemaining: room.timeRemaining
+                turnOrder: room.turnOrder,
+                currentTurnIndex: room.currentTurnIndex
             });
-
-            // Iniciar temporizador
-            startTimer(room);
         } catch (error) {
             console.error('Error iniciando juego:', error);
         }
     });
 
-    // Pausar/Reanudar juego
-    socket.on('toggle-pause', async (data) => {
+    // Pasar al siguiente turno
+    socket.on('next-turn', async (data) => {
         try {
             const room = await Room.findOne({ roomCode: data.roomCode });
 
-            if (!room || room.adminId !== socket.id) return;
+            if (!room || room.gameState !== 'started') return;
 
-            room.isPaused = !room.isPaused;
-            await room.save();
-
-            if (room.isPaused) {
-                clearInterval(roomTimers[data.roomCode]);
-            } else {
-                startTimer(room);
+            // Mover el primer jugador al final
+            if (room.turnOrder && room.turnOrder.length > 0) {
+                const currentPlayer = room.turnOrder.shift();
+                room.turnOrder.push(currentPlayer);
+                
+                await room.save();
+                
+                io.to(data.roomCode).emit('turn-updated', {
+                    turnOrder: room.turnOrder,
+                    currentPlayerName: room.players.find(p => p.id === room.turnOrder[0])?.name
+                });
             }
-
-            io.to(data.roomCode).emit('game-paused', { isPaused: room.isPaused });
         } catch (error) {
-            console.error('Error pausando juego:', error);
+            console.error('Error pasando turno:', error);
         }
     });
 
@@ -214,7 +307,6 @@ io.on('connection', (socket) => {
 
             if (!room || room.adminId !== socket.id) return;
 
-            clearInterval(roomTimers[data.roomCode]);
             room.gameState = 'voting';
             room.isPaused = false;
 
@@ -254,16 +346,12 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            // Actualizar usando set() para asegurar que Mongoose detecte el cambio
             room.players[playerIndex].hasVoted = true;
             room.players[playerIndex].votedFor = data.votedPlayerId;
-
-            // Marcar el array como modificado para que Mongoose lo guarde
             room.markModified('players');
 
             await room.save();
 
-            // Verificar que realmente se guardó
             const verifyRoom = await Room.findOne({ roomCode: data.roomCode });
             const verifyPlayer = verifyRoom.players.find(p => p.id === socket.id);
 
@@ -275,27 +363,11 @@ io.on('connection', (socket) => {
                 totalPlayers: room.players.length
             });
 
-            console.log('🔍 Verificación en DB:', {
-                hasVotedInMemory: room.players[playerIndex].hasVoted,
-                hasVotedInDB: verifyPlayer.hasVoted,
-                votedForInMemory: room.players[playerIndex].votedFor,
-                votedForInDB: verifyPlayer.votedFor
-            });
-
-            // Enviar actualización de la sala a todos los jugadores (usar sala de DB)
-            console.log('📤 Enviando room-update con players:', verifyRoom.players.map(p => ({
-                name: p.name,
-                hasVoted: p.hasVoted,
-                votedFor: p.votedFor
-            })));
             io.to(data.roomCode).emit('room-update', verifyRoom);
-            console.log('📤 room-update enviado a todos los jugadores');
 
-            // Verificar si todos votaron (usar sala de DB)
             const allVoted = verifyRoom.players.every(p => p.hasVoted);
 
             if (allVoted) {
-                // Contar votos
                 const voteCounts = {};
                 verifyRoom.players.forEach(p => {
                     if (p.votedFor) {
@@ -303,13 +375,11 @@ io.on('connection', (socket) => {
                     }
                 });
 
-                // Encontrar el máximo número de votos
                 let maxVotes = 0;
                 Object.values(voteCounts).forEach(votes => {
                     if (votes > maxVotes) maxVotes = votes;
                 });
 
-                // Encontrar todos los jugadores con el máximo de votos (posible empate)
                 const tiedPlayers = Object.entries(voteCounts)
                     .filter(([playerId, votes]) => votes === maxVotes)
                     .map(([playerId]) => playerId);
@@ -321,20 +391,17 @@ io.on('connection', (socket) => {
                     hayEmpate: tiedPlayers.length > 1
                 });
 
-                // CASO 1: HAY EMPATE
                 if (tiedPlayers.length > 1) {
                     console.log('⚖️ EMPATE DETECTADO - Nueva ronda de votación');
 
-                    // Resetear votos para nueva ronda
                     verifyRoom.players.forEach(player => {
                         player.hasVoted = false;
                         player.votedFor = null;
                     });
 
-                    verifyRoom.gameState = 'voting'; // Mantener en votación
+                    verifyRoom.gameState = 'voting';
                     await verifyRoom.save();
 
-                    // Notificar empate y nueva votación
                     io.to(data.roomCode).emit('voting-tie', {
                         tiedPlayers: tiedPlayers.map(id => {
                             const player = verifyRoom.players.find(p => p.id === id);
@@ -346,13 +413,11 @@ io.on('connection', (socket) => {
                         voteCounts
                     });
 
-                    // Enviar room-update para resetear UI
                     io.to(data.roomCode).emit('room-update', verifyRoom);
 
-                    return; // Salir y esperar nueva votación
+                    return;
                 }
 
-                // CASO 2: HAY GANADOR CLARO
                 const votedOutPlayerId = tiedPlayers[0];
                 const votedOutPlayer = verifyRoom.players.find(p => p.id === votedOutPlayerId);
                 const impostorFound = votedOutPlayer?.isImpostor || false;
@@ -396,8 +461,9 @@ io.on('connection', (socket) => {
             room.gameState = 'waiting';
             room.currentWord = null;
             room.currentHint = null;
-            room.timeRemaining = null;
             room.isPaused = false;
+            room.turnOrder = [];
+            room.currentTurnIndex = 0;
 
             room.players.forEach(player => {
                 player.isImpostor = false;
@@ -418,62 +484,59 @@ io.on('connection', (socket) => {
         console.log('🔌 Usuario desconectado:', socket.id);
 
         try {
+            const session = playerSessions.get(socket.id);
+            
+            if (session) {
+                console.log('📝 Sesión guardada para reconexión:', session);
+                // No eliminar inmediatamente, dar tiempo para reconectar
+                setTimeout(() => {
+                    if (playerSessions.has(socket.id)) {
+                        playerSessions.delete(socket.id);
+                        console.log('🗑️ Sesión expirada:', socket.id);
+                    }
+                }, 300000); // 5 minutos para reconectar
+            }
+
             const rooms = await Room.find({ 'players.id': socket.id });
 
             for (const room of rooms) {
-                room.players = room.players.filter(p => p.id !== socket.id);
+                // Notificar desconexión temporal
+                io.to(room.roomCode).emit('player-disconnected', {
+                    playerId: socket.id,
+                    playerName: room.players.find(p => p.id === socket.id)?.name
+                });
 
-                if (room.players.length === 0) {
-                    await Room.deleteOne({ _id: room._id });
-                    clearInterval(roomTimers[room.roomCode]);
-                } else {
-                    // Si el admin se desconecta, asignar nuevo admin
-                    if (room.adminId === socket.id && room.players.length > 0) {
-                        room.adminId = room.players[0].id;
-                        room.players[0].isAdmin = true;
+                // Esperar 30 segundos antes de eliminar definitivamente
+                setTimeout(async () => {
+                    const currentRoom = await Room.findOne({ roomCode: room.roomCode });
+                    if (!currentRoom) return;
+
+                    const playerStillDisconnected = !currentRoom.players.find(p => 
+                        p.id === socket.id && io.sockets.sockets.has(socket.id)
+                    );
+
+                    if (playerStillDisconnected) {
+                        currentRoom.players = currentRoom.players.filter(p => p.id !== socket.id);
+
+                        if (currentRoom.players.length === 0) {
+                            await Room.deleteOne({ _id: currentRoom._id });
+                        } else {
+                            if (currentRoom.adminId === socket.id && currentRoom.players.length > 0) {
+                                currentRoom.adminId = currentRoom.players[0].id;
+                                currentRoom.players[0].isAdmin = true;
+                            }
+
+                            await currentRoom.save();
+                            io.to(currentRoom.roomCode).emit('room-update', currentRoom);
+                        }
                     }
-
-                    await room.save();
-                    io.to(room.roomCode).emit('room-update', room);
-                }
+                }, 30000); // 30 segundos
             }
         } catch (error) {
             console.error('Error en desconexión:', error);
         }
     });
 });
-
-// Función para manejar el temporizador
-function startTimer(room) {
-    clearInterval(roomTimers[room.roomCode]);
-
-    roomTimers[room.roomCode] = setInterval(async () => {
-        try {
-            const updatedRoom = await Room.findOne({ roomCode: room.roomCode });
-
-            if (!updatedRoom || updatedRoom.isPaused || updatedRoom.gameState !== 'started') {
-                clearInterval(roomTimers[room.roomCode]);
-                return;
-            }
-
-            updatedRoom.timeRemaining -= 1;
-
-            if (updatedRoom.timeRemaining <= 0) {
-                clearInterval(roomTimers[room.roomCode]);
-                updatedRoom.gameState = 'voting';
-                updatedRoom.timeRemaining = 0;
-                await updatedRoom.save();
-                io.to(room.roomCode).emit('voting-started', updatedRoom);
-            } else {
-                await updatedRoom.save();
-                io.to(room.roomCode).emit('time-update', { timeRemaining: updatedRoom.timeRemaining });
-            }
-        } catch (error) {
-            console.error('Error en temporizador:', error);
-            clearInterval(roomTimers[room.roomCode]);
-        }
-    }, 1000);
-}
 
 // Health check
 app.get('/health', (req, res) => {
