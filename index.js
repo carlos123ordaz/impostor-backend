@@ -451,6 +451,56 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Salir del juego intencionalmente
+    socket.on('leave-game', async (data) => {
+        try {
+            console.log('🚪 Usuario saliendo intencionalmente:', socket.id);
+            
+            // Limpiar sesión
+            playerSessions.delete(socket.id);
+            
+            const room = await Room.findOne({ roomCode: data.roomCode });
+            if (!room) return;
+
+            // Eliminar jugador inmediatamente
+            const playerName = room.players.find(p => p.id === socket.id)?.name;
+            room.players = room.players.filter(p => p.id !== socket.id);
+
+            // Actualizar turnOrder si existe
+            if (room.turnOrder && room.turnOrder.length > 0) {
+                room.turnOrder = room.turnOrder.filter(id => id !== socket.id);
+            }
+
+            if (room.players.length === 0) {
+                // Si no quedan jugadores, eliminar sala
+                await Room.deleteOne({ _id: room._id });
+                console.log('🗑️ Sala eliminada (sin jugadores):', room.roomCode);
+            } else {
+                // Si el admin se fue, asignar nuevo admin
+                if (room.adminId === socket.id && room.players.length > 0) {
+                    room.adminId = room.players[0].id;
+                    room.players[0].isAdmin = true;
+                    console.log('👑 Nuevo admin asignado:', room.players[0].name);
+                }
+
+                await room.save();
+                
+                // Notificar a los demás
+                io.to(data.roomCode).emit('player-left', {
+                    playerName,
+                    playerId: socket.id
+                });
+                
+                io.to(data.roomCode).emit('room-update', room);
+                console.log('✅ Jugador eliminado de la sala:', playerName);
+            }
+
+            socket.leave(data.roomCode);
+        } catch (error) {
+            console.error('Error en leave-game:', error);
+        }
+    });
+
     // Reiniciar juego
     socket.on('restart-game', async (data) => {
         try {
@@ -486,6 +536,12 @@ io.on('connection', (socket) => {
         try {
             const session = playerSessions.get(socket.id);
             
+            // Si la sesión ya fue eliminada (por leave-game), no hacer nada más
+            if (!session) {
+                console.log('ℹ️ Sesión ya limpiada (salida intencional)');
+                return;
+            }
+
             if (session) {
                 console.log('📝 Sesión guardada para reconexión:', session);
                 // No eliminar inmediatamente, dar tiempo para reconectar
@@ -500,7 +556,7 @@ io.on('connection', (socket) => {
             const rooms = await Room.find({ 'players.id': socket.id });
 
             for (const room of rooms) {
-                // Notificar desconexión temporal
+                // Notificar desconexión temporal (no salida)
                 io.to(room.roomCode).emit('player-disconnected', {
                     playerId: socket.id,
                     playerName: room.players.find(p => p.id === socket.id)?.name
@@ -511,12 +567,24 @@ io.on('connection', (socket) => {
                     const currentRoom = await Room.findOne({ roomCode: room.roomCode });
                     if (!currentRoom) return;
 
+                    // Verificar si el jugador sigue desconectado
                     const playerStillDisconnected = !currentRoom.players.find(p => 
                         p.id === socket.id && io.sockets.sockets.has(socket.id)
                     );
 
                     if (playerStillDisconnected) {
+                        // Verificar si todavía tiene sesión (si no, ya fue eliminado por leave-game)
+                        if (!playerSessions.has(socket.id)) {
+                            console.log('ℹ️ Jugador ya eliminado por salida intencional');
+                            return;
+                        }
+
                         currentRoom.players = currentRoom.players.filter(p => p.id !== socket.id);
+
+                        // Actualizar turnOrder
+                        if (currentRoom.turnOrder && currentRoom.turnOrder.length > 0) {
+                            currentRoom.turnOrder = currentRoom.turnOrder.filter(id => id !== socket.id);
+                        }
 
                         if (currentRoom.players.length === 0) {
                             await Room.deleteOne({ _id: currentRoom._id });
