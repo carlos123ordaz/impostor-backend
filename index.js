@@ -12,7 +12,12 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
     cors: {
-        origin: process.env.CLIENT_URL || "http://localhost:5173",
+         origin: [
+          "http://localhost:5173",
+          "http://localhost:3000",
+          "https://www.impostor.lat",
+          "https://impostor.lat"
+        ],
         methods: ["GET", "POST"]
     },
     pingTimeout: 60000,
